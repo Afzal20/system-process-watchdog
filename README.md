@@ -2,6 +2,10 @@
 
 A lightweight, intelligent background daemon that prevents Linux desktop freezes and system lockups caused by runaway CPU or RAM processes, without terminating productive applications.
 
+> [!WARNING]
+> **Please check the code before use in your computer.**
+> Always review the source code, installation scripts, and configurations before running them with root privileges on your system.
+
 ---
 
 ## Why this exists
