@@ -1,5 +1,7 @@
 # Linux System Process Watchdog
 
+![Linux System Process Watchdog Banner](assets/cover.jpg)
+
 A lightweight, intelligent background daemon that prevents Linux desktop freezes and system lockups caused by runaway CPU or RAM processes, without terminating productive applications.
 
 > [!WARNING]
@@ -8,15 +10,38 @@ A lightweight, intelligent background daemon that prevents Linux desktop freezes
 
 ---
 
-## Why this exists
+## Why this exists: The Multi-Core False Positive Problem
 
-On Linux developer machines running multiple Docker containers, code editors, background compilers, and dozens of browser tabs, rogue infinite loops or runaway threads can lock up the entire desktop interface.
+On modern Linux developer machines running multiple Docker containers, code editors, background compilers, and dozens of browser tabs, rogue infinite loops or runaway threads can lock up the entire desktop interface.
 
 Standard out-of-memory killers (like `earlyoom`) handle RAM exhaustion very well, but CPU thread deadlocks can still freeze mouse cursors, window compositors, and shell sessions.
 
-Many naive watchdog scripts attempt to solve this by measuring per-process CPU percentage and killing anything that exceeds a fixed threshold (e.g. 90%). On modern multi-core systems, this causes serious false positives: a single Chrome WebAssembly thread or a Rust compilation peaking at 100% on one core represents only a fraction of total multi-core capacity (e.g. 12.5% on an 8-thread CPU). The system is not actually freezing, yet the naive watchdog kills the user's browser or IDE.
+### The Naive Watchdog Trap
 
-This daemon solves that problem with multi-core awareness, whole-system load checks, graceful priority throttling, and comprehensive application whitelisting.
+Many naive watchdog scripts attempt to solve this by measuring per-process CPU percentage and killing anything that exceeds a fixed threshold (e.g. 90%). 
+
+On modern multi-core systems, this causes **serious false positives**: a single Chrome WebAssembly thread, video decoding job, or Rust compilation peaking at 100% on one core represents only a fraction of total multi-core capacity (e.g. 12.5% on an 8-thread CPU). The system is not actually freezing, yet the naive watchdog kills the user's browser or IDE.
+
+![btop monitor demonstrating single core saturation vs 13% total CPU load](assets/btop_100pct_screenshot.png)
+
+### Understanding the Problem from the Screenshot Above
+
+Looking closely at the real-world `btop` system monitor capture above illustrates exactly why naive process killers fail:
+
+1. **Single Core Maxed Out (`C0` at 100%)**:
+   - In the CPU core monitor (top right), core **`C0`** is pegged at **100%** (indicated by the solid red bar).
+2. **Overall System is Mostly Idle (`13%` Total CPU, Load Avg 0.54)**:
+   - Despite core `C0` running at full speed, all other cores (**`C1` through `C7`**) are idling between **4% and 13%**.
+   - Total machine CPU usage is only **13%**. The desktop window manager, compositor (`picom`), Xorg, and terminal shells have **87% available headroom** and are completely fluid and responsive.
+3. **The "Offending" Process (`PID 92181: chrome --type=renderer` at 107%)**:
+   - In the process list, a legitimate Google Chrome renderer thread is executing heavy client-side computation, registering at **107%** CPU (saturating 1 full logical core).
+4. **What a Naive Watchdog Does (Destructive False Positive)**:
+   - A naive script checking `if process_cpu > 90% then kill` sees Chrome at 107% and sends `SIGKILL`.
+   - **Result:** The user's active browser tab crashes, losing unsaved web apps, forms, or documents—even though the computer was running smoothly without any freeze.
+5. **How This Intelligent Watchdog Solves It**:
+   - **Step 1 (Whole-System Check):** Evaluates aggregate CPU from `/proc/stat`. Since total system load is 13% (well below the 85% `TOTAL_SYS_CPU_THRESHOLD`), it takes **no destructive action**.
+   - **Step 2 (Productivity Whitelist):** Even during genuine total system overload, `chrome` is protected by the built-in immunity whitelist and will never be killed.
+   - **Step 3 (Gentle Priority Throttling):** If an *unknown* non-whitelisted runaway loop pegs cores during genuine system-wide distress, it first throttles its priority to `nice +19` at 30 seconds. This immediately yields CPU cycles back to the desktop UI without terminating the program or losing data.
 
 ---
 
