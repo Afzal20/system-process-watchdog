@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""
+System Process Watchdog Daemon
+Monitors and mitigates runaway processes that consume excessive CPU or RAM
+to prevent system lockups, freezing, and unresponsiveness.
+Protects productive applications (browsers, IDEs, compilers) while gently
+throttling rogue processes to keep the user interface responsive.
+"""
+
+import os
+import sys
+import time
+import signal
+import subprocess
+import logging
+import pwd
+
+LOG_FILE = "/var/log/process-watchdog.log"
+CONF_FILE = "/etc/process-watchdog.conf"
+
+DEFAULT_WHITELIST = set([
+    "init", "systemd", "Xorg", "xfwm4", "xfce4-session", "xfce4-panel", "xfsettingsd",
+    "dbus-daemon", "polkitd", "pipewire", "wireplumber", "pulseaudio",
+    "systembus-notify", "earlyoom", "ananicy-cpp", "irqbalance", "sshd",
+    "antigravity", "antigravity-ide", "antigravity-agent", "antigravity-cli", "agy", "agent",
+    "bash", "fish", "zsh", "sh", "xfce4-terminal", "alacritty", "kitty",
+    "btd", "lightdm", "picom", "xcape", "rofi",
+    "chrome", "google-chrome", "chromium", "brave", "firefox", "zen", "epiphany",
+    "code", "Code", "vscode", "nvim", "neovim", "vim", "nano", "emacs",
+    "sublime_text", "idea", "clion", "pycharm", "webstorm", "studio",
+    "flutter", "dart", "node", "npm", "npx", "yarn", "pnpm",
+    "java", "javac", "python", "python3", "rustc", "cargo",
+    "gcc", "g++", "clang", "clang++", "cmake", "ninja", "make",
+    "git", "docker", "dockerd", "containerd", "electron"
+])
+
+def setup_logging():
+    try:
+        logging.basicConfig(
+            filename=LOG_FILE,
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s"
+        )
+    except Exception:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s"
+        )
+
+def load_config():
+    conf = {
+        "TOTAL_SYS_CPU_THRESHOLD": 85.0,  # Only intervene if whole system CPU >= 85%
+        "PROC_CPU_THRESHOLD": 350.0,      # On multi-core systems, 350% = 3.5 cores pegged
+        "CPU_MAX_SECONDS": 60.0,
+        "CPU_WARN_SECONDS": 30.0,
+        "RAM_THRESHOLD": 85.0,
+        "WHITELIST": set(DEFAULT_WHITELIST)
+    }
+    if os.path.exists(CONF_FILE):
+        try:
+            with open(CONF_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip()
+                        if k in ("TOTAL_SYS_CPU_THRESHOLD", "PROC_CPU_THRESHOLD", "CPU_MAX_SECONDS", "CPU_WARN_SECONDS", "RAM_THRESHOLD"):
+                            conf[k] = float(v)
+                        elif k == "CPU_THRESHOLD":
+                            # Backward compatibility: if legacy CPU_THRESHOLD is present
+                            val = float(v)
+                            if val <= 100.0:
+                                conf["TOTAL_SYS_CPU_THRESHOLD"] = val
+                            else:
+                                conf["PROC_CPU_THRESHOLD"] = val
+                        elif k == "WHITELIST":
+                            items = [x.strip() for x in v.split(",") if x.strip()]
+                            conf["WHITELIST"] = conf["WHITELIST"].union(set(items))
+        except Exception as e:
+            logging.error(f"Error reading config: {e}")
+    return conf
+
+def get_desktop_user():
+    """Detects active desktop user and UID for graphical notifications."""
+    try:
+        out = subprocess.check_output(["loginctl", "list-sessions", "--no-legend"], text=True)
+        for line in out.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                session_id, uid, user = parts[0], parts[1], parts[2]
+                session_info = subprocess.check_output(["loginctl", "show-session", session_id, "-p", "Type", "-p", "Active"], text=True)
+                if "Active=yes" in session_info and ("Type=x11" in session_info or "Type=wayland" in session_info):
+                    return user, uid
+    except Exception:
+        pass
+    user = os.environ.get("SUDO_USER") or os.environ.get("LOGNAME")
+    if not user or user == "root":
+        users = [u for u in pwd.getpwall() if u.pw_uid >= 1000 and u.pw_uid < 65000 and u.pw_dir.startswith("/home/")]
+        if users:
+            return users[0].pw_name, str(users[0].pw_uid)
+        return "root", "0"
+    try:
+        uid = str(pwd.getpwnam(user).pw_uid)
+    except Exception:
+        uid = "1000"
+    return user, uid
+
+def send_notification(summary, body, urgency="normal"):
+    """Dispatches a desktop notification via notify-send to the active user session."""
+    try:
+        user, uid = get_desktop_user()
+        if user == "root":
+            return
+        cmd = [
+            "notify-send",
+            "-u", urgency,
+            "-a", "Process Watchdog",
+            summary,
+            body
+        ]
+        full_cmd = ["su", user, "-c", f"DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus " + " ".join(f'"{x}"' for x in cmd)]
+        subprocess.run(full_cmd, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logging.warning(f"Notification error: {e}")
+
+def get_sys_ticks():
+    """Reads total and idle CPU ticks from /proc/stat."""
+    try:
+        with open("/proc/stat") as f:
+            parts = [int(x) for x in f.readline().split()[1:]]
+            total = sum(parts)
+            idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+            return total, idle
+    except Exception:
+        return 0, 0
+
+def is_whitelisted(pid, comm, whitelist):
+    """Checks process name and command line against immune whitelist."""
+    if comm in whitelist or comm.startswith("kworker") or comm.startswith("rcu_") or comm.startswith("irq/"):
+        return True
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().decode("utf-8", errors="ignore").lower()
+            for w in whitelist:
+                if w.lower() in cmd:
+                    return True
+    except Exception:
+        pass
+    return False
+
+def get_process_info():
+    """Scans /proc for active processes, their CPU ticks, comm, and RSS memory."""
+    procs = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                content = f.read()
+            comm_start = content.find("(")
+            comm_end = content.rfind(")")
+            comm = content[comm_start + 1:comm_end]
+            fields = content[comm_end + 2:].split()
+            utime = int(fields[11])
+            stime = int(fields[12])
+            ticks = utime + stime
+            rss_pages = int(fields[21])
+            procs[pid] = (ticks, comm, rss_pages * 4)
+        except Exception:
+            continue
+    return procs
+
+def get_total_ram_kb():
+    """Reads total system RAM from /proc/meminfo."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1])
+    except Exception:
+        return 16 * 1024 * 1024
+
+def check_and_trim_cache():
+    """Trims clean page cache if cached memory exceeds 2.5 GB."""
+    try:
+        cached_kb = 0
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("Cached:"):
+                    cached_kb = int(line.split()[1])
+                    break
+        if cached_kb > 2500000:
+            subprocess.run(["sync"])
+            with open("/proc/sys/vm/drop_caches", "w") as f:
+                f.write("3\n")
+            logging.info(f"Auto-trimmed page cache (reclaimed from {cached_kb // 1024} MB)")
+    except Exception as e:
+        logging.warning(f"Cache trim error: {e}")
+
+def main():
+    setup_logging()
+    logging.info("System Process Watchdog started (Multi-core load protection active).")
+    conf = load_config()
+    num_cpus = os.cpu_count() or 4
+    total_ram_kb = get_total_ram_kb()
+    
+    violations = {}
+    prev_procs = get_process_info()
+    prev_total_ticks, prev_idle_ticks = get_sys_ticks()
+    cache_check_counter = 0
+    
+    INTERVAL = 5
+    
+    while True:
+        time.sleep(INTERVAL)
+        cache_check_counter += INTERVAL
+        if cache_check_counter >= 60:
+            cache_check_counter = 0
+            check_and_trim_cache()
+            
+        conf = load_config()
+        curr_total_ticks, curr_idle_ticks = get_sys_ticks()
+        curr_procs = get_process_info()
+        
+        total_delta = curr_total_ticks - prev_total_ticks
+        idle_delta = curr_idle_ticks - prev_idle_ticks
+        if total_delta <= 0:
+            total_delta = 1
+            
+        busy_delta = max(0, total_delta - idle_delta)
+        system_cpu_percent = (busy_delta / total_delta) * 100.0
+        system_is_stressed = (system_cpu_percent >= conf["TOTAL_SYS_CPU_THRESHOLD"])
+        
+        current_pids = set(curr_procs.keys())
+        
+        for pid, (curr_ticks, comm, rss_kb) in curr_procs.items():
+            if pid <= 1:
+                continue
+            if is_whitelisted(pid, comm, conf["WHITELIST"]):
+                continue
+                
+            prev_data = prev_procs.get(pid)
+            if not prev_data:
+                continue
+                
+            prev_ticks = prev_data[0]
+            proc_delta = curr_ticks - prev_ticks
+            
+            # CPU percent: 100% = 1 full core, (num_cpus * 100)% = entire capacity
+            proc_cpu_percent = (proc_delta / total_delta) * 100.0 * num_cpus
+            ram_percent = (rss_kb / total_ram_kb) * 100.0 if total_ram_kb > 0 else 0
+            
+            # An app is only considered runaway if BOTH system is heavily stressed AND process is monopolizing CPU
+            is_over_cpu = system_is_stressed and (proc_cpu_percent >= conf["PROC_CPU_THRESHOLD"])
+            is_over_ram = (ram_percent >= conf["RAM_THRESHOLD"])
+            
+            if is_over_cpu or is_over_ram:
+                if pid not in violations:
+                    violations[pid] = {"seconds": 0, "warned": False, "throttled": False, "comm": comm}
+                violations[pid]["seconds"] += INTERVAL
+                violations[pid]["comm"] = comm
+                sec = violations[pid]["seconds"]
+                
+                # Gentle Throttling: lower scheduling priority first so UI remains responsive
+                if not violations[pid]["throttled"]:
+                    try:
+                        os.setpriority(os.PRIO_PROCESS, pid, 19)
+                        violations[pid]["throttled"] = True
+                        logging.info(f"Throttled rogue process priority to nice +19: {comm} (PID {pid})")
+                    except Exception:
+                        pass
+                
+                if sec >= conf["CPU_WARN_SECONDS"] and not violations[pid]["warned"]:
+                    violations[pid]["warned"] = True
+                    reason = f"CPU: {proc_cpu_percent:.0f}% (System: {system_cpu_percent:.0f}%)" if is_over_cpu else f"RAM: {ram_percent:.0f}%"
+                    msg = f"Process '{comm}' (PID {pid}) using {reason} for {sec}s. Priority throttled."
+                    logging.warning(f"Warning: {msg}")
+                    send_notification("⚠️ High Resource Warning", msg, urgency="normal")
+                    
+                if sec >= conf["CPU_MAX_SECONDS"]:
+                    reason = f"CPU: {proc_cpu_percent:.0f}% (System: {system_cpu_percent:.0f}%)" if is_over_cpu else f"RAM: {ram_percent:.0f}%"
+                    logging.critical(f"Terminating persistent rogue process: {comm} (PID {pid}) - {reason} for {sec}s")
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        time.sleep(2)
+                        if os.path.exists(f"/proc/{pid}"):
+                            os.kill(pid, signal.SIGKILL)
+                            logging.critical(f"Forcefully killed rogue PID {pid} with SIGKILL.")
+                        msg = f"Rogue process '{comm}' (PID {pid}) terminated to prevent system freeze ({reason} for {sec}s)."
+                        send_notification("🚨 Rogue Process Terminated", msg, urgency="critical")
+                    except ProcessLookupError:
+                        pass
+                    except Exception as e:
+                        logging.error(f"Error terminating {pid}: {e}")
+                    del violations[pid]
+            else:
+                if pid in violations:
+                    del violations[pid]
+                    
+        violations = {p: v for p, v in violations.items() if p in current_pids}
+        prev_procs = curr_procs
+        prev_total_ticks = curr_total_ticks
+        prev_idle_ticks = curr_idle_ticks
+
+if __name__ == "__main__":
+    main()

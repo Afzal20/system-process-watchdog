@@ -1,0 +1,15 @@
+[Unit]
+Description=System Process Watchdog (Anti-Freeze & Multi-Core Protection Daemon)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/system-process-watchdog
+Restart=always
+RestartSec=5
+Nice=-15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
